@@ -232,6 +232,54 @@ func TestRelayReportsUnavailableApplication(t *testing.T) {
 	}
 }
 
+func TestClosingSessionDoesNotReturnSuccessfulResponse(t *testing.T) {
+	started := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(origin.Close)
+	b := testBroker(t)
+	s, err := b.add(1, request{Port: backendPort(t, origin)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := httptest.NewServer(b)
+	t.Cleanup(front.Close)
+	t.Cleanup(func() { b.remove(s) })
+	client := front.Client()
+	client.Timeout = 2 * time.Second
+	request, err := http.NewRequest(http.MethodGet, front.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = s.host
+	done := make(chan int, 1)
+	go func() {
+		response, err := client.Do(request)
+		if err != nil {
+			done <- 0
+			return
+		}
+		defer response.Body.Close()
+		done <- response.StatusCode
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("request did not reach application")
+	}
+	b.remove(s)
+	select {
+	case status := <-done:
+		if status != 0 && status < 400 {
+			t.Fatalf("session closure returned success: %d", status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active request remained blocked after session closure")
+	}
+}
+
 func TestRelayConcurrentNavigationAndCancellation(t *testing.T) {
 	started, canceled := make(chan struct{}), make(chan struct{})
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

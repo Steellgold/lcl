@@ -118,10 +118,9 @@ func newSession(host string, uid uint32, r request) *session {
 		}
 		p.Out.Header.Set("X-Forwarded-Proto", scheme)
 	}, ErrorHandler: func(w http.ResponseWriter, r *http.Request, e error) {
-		if r.Context().Err() != nil {
-			return
+		if r.Context().Err() == nil {
+			log.Printf("proxy %s: %v", s.host, e)
 		}
-		log.Printf("proxy %s: %v", s.host, e)
 		var timeout net.Error
 		if errors.As(e, &timeout) && timeout.Timeout() {
 			http.Error(w, "lcl: local application timed out", http.StatusGatewayTimeout)
