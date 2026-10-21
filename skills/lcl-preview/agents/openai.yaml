@@ -1,0 +1,4 @@
+interface:
+  display_name: "lcl Preview"
+  short_description: "Share local HTTP apps with temporary public URLs"
+  default_prompt: "Use $lcl-preview to publish my local HTTP app with the requested name and lifetime."

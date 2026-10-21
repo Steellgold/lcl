@@ -104,6 +104,22 @@ make check
 
 The tests cover proxy forwarding, the client relay, route removal, unlimited sessions and fixed timeouts, WebSocket upgrades and traffic, user quotas, name normalization and collisions, and input validation. `make check` includes the race detector and requires a C compiler. GitHub Actions runs these checks and builds the binary and Docker image on pushes to `stable` and pull requests.
 
+## AI skills
+
+Give your assistant the skill folder for the task, or install that folder using your assistant's supported skill mechanism:
+
+- [lcl-preview](skills/lcl-preview/SKILL.md): open, verify, and close public previews, including names, fixed timeouts, HTTPS, and container clients.
+- [lcl-deploy](skills/lcl-deploy/SKILL.md): install or update the broker and client while preserving the existing Traefik setup.
+
+Each folder contains a `SKILL.md` entrypoint and optional UI metadata. Share the entire folder so any bundled references remain available. The skills are written in English and contain no server-specific configuration. Adding a skill supplies instructions; installing or updating the software is a separate operation.
+
+Example requests for assistants that support `$skill-name` invocation:
+
+```text
+Use $lcl-preview to share my app on port 3000 as "First version" for 20 minutes.
+Use $lcl-deploy to update my existing lcl installation from stable.
+```
+
 ## Access model
 
 URLs are public. A random hostname is not authentication. Any local user with socket access can publish an HTTP service accessible in their network namespace, including services started by other users. Use this on servers whose local users are trusted to publish those services.

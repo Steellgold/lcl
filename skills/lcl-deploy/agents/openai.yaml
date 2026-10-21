@@ -1,0 +1,4 @@
+interface:
+  display_name: "lcl Deployment"
+  short_description: "Install and update the lcl broker behind Traefik"
+  default_prompt: "Use $lcl-deploy to install or update lcl while preserving my existing Traefik configuration."
