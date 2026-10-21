@@ -33,13 +33,17 @@ type request struct {
 	Tunnel     bool          `json:"tunnel,omitempty"`
 	Attach     string        `json:"attach,omitempty"`
 	RelayError string        `json:"relay_error,omitempty"`
+	Logs       bool          `json:"logs,omitempty"`
+	Watch      string        `json:"watch,omitempty"`
 	dial       func(context.Context) (net.Conn, error)
+	logs       *accessLogStream
 }
 type reply struct {
 	URL     string `json:"url,omitempty"`
 	Error   string `json:"error,omitempty"`
 	Message string `json:"message,omitempty"`
 	Dial    string `json:"dial,omitempty"`
+	Logs    string `json:"logs,omitempty"`
 }
 type session struct {
 	host      string
@@ -53,6 +57,7 @@ type session struct {
 	cancel    context.CancelFunc
 	mu        sync.Mutex
 	conns     map[*sessionConn]bool
+	logs      *accessLogStream
 }
 type sessionConn struct {
 	net.Conn
@@ -80,7 +85,7 @@ func (s *session) close() {
 }
 func newSession(host string, uid uint32, r request) *session {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &session{host: host, uid: uid, https: r.HTTPS, named: r.Name != "", ctx: ctx, cancel: cancel, conns: map[*sessionConn]bool{}}
+	s := &session{host: host, uid: uid, https: r.HTTPS, named: r.Name != "", ctx: ctx, cancel: cancel, conns: map[*sessionConn]bool{}, logs: r.logs}
 	if r.Timeout > 0 {
 		s.deadline = time.Now().Add(r.Timeout)
 	}
@@ -331,6 +336,9 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	stop := context.AfterFunc(s.ctx, cancel)
 	defer stop()
+	if s.logs != nil {
+		w = &accessLogWriter{ResponseWriter: w, stream: s.logs, method: r.Method, path: r.URL.EscapedPath(), started: time.Now()}
+	}
 	s.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 func peerUID(c *net.UnixConn) (uint32, error) {
@@ -378,6 +386,10 @@ func (b *broker) control(c *net.UnixConn) {
 		return
 	}
 	c.SetReadDeadline(time.Time{})
+	if r.Watch != "" {
+		b.watchLogs(c, uid, r.Watch)
+		return
+	}
 	if r.Attach != "" {
 		b.mu.RLock()
 		p := b.pending[r.Attach]
@@ -411,6 +423,13 @@ func (b *broker) control(c *net.UnixConn) {
 	if r.Tunnel {
 		r.dial = func(ctx context.Context) (net.Conn, error) { return b.tunnelDial(ctx, uid, send) }
 	}
+	if r.Logs {
+		r.logs, e = newAccessLogStream()
+		if e != nil {
+			send(reply{Error: "could not initialize request logs"})
+			return
+		}
+	}
 	s, e := b.add(uid, r)
 	if e != nil {
 		enc.Encode(reply{Error: e.Error()})
@@ -422,7 +441,11 @@ func (b *broker) control(c *net.UnixConn) {
 		scheme = "https"
 	}
 	c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if e = send(reply{URL: scheme + "://" + s.host}); e != nil {
+	initial := reply{URL: scheme + "://" + s.host}
+	if s.logs != nil {
+		initial.Logs = s.logs.token
+	}
+	if e = send(initial); e != nil {
 		return
 	}
 	disconnected := make(chan struct{})
@@ -546,7 +569,7 @@ func env(k, d string) string {
 const usage = "usage: lcl <port> [--https] [-t <minutes>] [--name <name>]"
 
 func parseClientArgs(args []string) (request, string, error) {
-	r := request{Tunnel: true}
+	r := request{Tunnel: true, Logs: true}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		key, value, hasValue := strings.Cut(arg, "=")
@@ -607,10 +630,10 @@ func client(args []string) error {
 	}
 	switch action {
 	case "help":
-		fmt.Println("Usage: lcl <port> [--https] [-t <minutes>] [--name <name>]\n\nPublish a local HTTP application under a random or chosen subdomain.\nSessions stay open until Ctrl+C or client disconnection by default.\n-t, --timeout <minutes>: close after a fixed duration, regardless of traffic.\n--name <name>: choose a subdomain; spaces and Latin accents are normalized.\n--https: enable public HTTPS; the local application still uses HTTP.\nPorts: 1024-65535. Limit: 8 sessions per user.")
+		fmt.Println("Usage: lcl <port> [--https] [-t <minutes>] [--name <name>]\n\nPublish a local HTTP application under a random or chosen subdomain.\nSessions stay open until Ctrl+C or client disconnection by default.\n-t, --timeout <minutes>: close after a fixed duration, regardless of traffic.\n--name <name>: choose a subdomain; spaces and Latin accents are normalized.\n--https: enable public HTTPS; the local application still uses HTTP.\nRequest logs show method, status, path, and time to response headers.\nColors are automatic in terminals; set NO_COLOR=1 to disable them.\nPorts: 1024-65535. Limit: 8 sessions per user.")
 		return nil
 	case "version":
-		fmt.Println("lcl 1.2.1")
+		fmt.Println("lcl 1.3.0")
 		return nil
 	}
 	port, https := options.Port, options.HTTPS
@@ -639,6 +662,13 @@ func client(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
+	logConn, e := connectAccessLogs(ctx, r.Logs)
+	if e != nil {
+		fmt.Fprintln(os.Stderr, "lcl: request logs unavailable:", e)
+	}
+	if logConn != nil {
+		defer logConn.Close()
+	}
 	if !https {
 		fmt.Fprintln(os.Stderr, "Preparing public route...")
 		if e = waitForRoute(ctx, r.URL); e != nil {
@@ -653,6 +683,10 @@ func client(args []string) error {
 	}
 	if https {
 		fmt.Println("  The HTTPS certificate may take a moment to be issued.")
+	}
+	if logConn != nil {
+		fmt.Println()
+		go printAccessLogs(ctx, logConn, os.Stdout, terminalColors(os.Stdout))
 	}
 	done := make(chan error, 1)
 	go func() {

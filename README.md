@@ -8,6 +8,9 @@ $ lcl 3000
   http://a3f09d72b18c460e.preview.example.com → http://127.0.0.1:3000
 
   Stays open until you stop it. Press Ctrl+C to stop.
+
+  GET     200  /  12ms
+  POST    201  /api/items  34ms
 ```
 
 `lcl` runs on the same server as your application. A local broker creates a route in your existing Traefik proxy. No external tunnel service or client account is involved.
@@ -15,6 +18,7 @@ $ lcl 3000
 - Random subdomains, or a chosen name with `--name`.
 - Unlimited session lifetime by default, with an optional fixed timeout.
 - WebSocket and server-sent event support.
+- Live request logs with colored HTTP statuses in your terminal.
 - Ctrl+C closes the session, including open connections.
 - One shared installation for all local users, without giving them Docker access.
 - Optional public HTTPS with an existing Traefik certificate or ACME resolver.
@@ -42,6 +46,14 @@ Use `-t <minutes>` or `--timeout <minutes>` for an automatic cutoff. For example
 For HTTP sessions, the client checks the public route before printing the URL. This usually takes a few seconds while Traefik loads the change. The timeout includes this setup time; readiness checks do not call your application.
 
 Each Linux user can hold eight sessions; the broker accepts 256 sessions in total. Sessions are not restored after a broker restart.
+
+### Request logs
+
+The terminal running `lcl` displays each request's method, HTTP status, path, and time to response headers. Logs appear when response headers are sent, so SSE requests and WebSocket upgrades appear while their connections remain open. This duration excludes downloading the response body. Broker-generated `502` and `504` responses appear too; internal route readiness probes do not.
+
+Statuses are cyan for informational responses, green for successes, blue for redirects, yellow for client errors, and red for server errors. Colors are automatic when stdout is a terminal; redirected output is plain text. Set `NO_COLOR=1` or `TERM=dumb` to disable colors.
+
+Query strings, headers, and request bodies are omitted. Paths are escaped for terminal safety and truncated at 2,048 bytes. Logs are streamed to the owning client over a separate authenticated socket and are not stored by the broker. If output cannot keep up, the bounded queue drops records and reports the skipped count when output resumes; forwarding continues independently.
 
 ## Install
 
@@ -106,7 +118,20 @@ The tests exercise complete HTTP-to-Unix-to-TCP relays, including idle connectio
 
 ## AI skills
 
-Give your assistant the skill folder for the task, or install that folder using your assistant's supported skill mechanism:
+Install the skills with the [skills CLI](https://skills.sh/docs/cli), then select your coding assistant:
+
+```sh
+npx skills add Steellgold/lcl
+```
+
+To inspect available skills without installing them, or install just the preview skill:
+
+```sh
+npx skills add Steellgold/lcl --list
+npx skills add Steellgold/lcl --skill lcl-preview
+```
+
+You can also give your assistant the skill folder directly or use its supported skill mechanism:
 
 - [lcl-preview](skills/lcl-preview/SKILL.md): open, verify, and close public previews, including names, fixed timeouts, HTTPS, and container clients.
 - [lcl-deploy](skills/lcl-deploy/SKILL.md): install or update the broker and client while preserving the existing Traefik setup.

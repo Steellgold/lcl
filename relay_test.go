@@ -22,6 +22,7 @@ type relayedPreview struct {
 	front  *httptest.Server
 	host   string
 	client *http.Client
+	logs   *accessLogConnection
 }
 
 func startRelayedPreview(t *testing.T, origin *httptest.Server) *relayedPreview {
@@ -52,7 +53,7 @@ func startRelayedPreview(t *testing.T, origin *httptest.Server) *relayedPreview 
 		t.Fatal(err)
 	}
 	control.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if err = json.NewEncoder(control).Encode(request{Port: backendPort(t, origin), Tunnel: true, Name: "Etat de première version"}); err != nil {
+	if err = json.NewEncoder(control).Encode(request{Port: backendPort(t, origin), Tunnel: true, Logs: true, Name: "Etat de première version"}); err != nil {
 		t.Fatal(err)
 	}
 	decoder := json.NewDecoder(control)
@@ -62,6 +63,10 @@ func startRelayedPreview(t *testing.T, origin *httptest.Server) *relayedPreview 
 	}
 	control.SetReadDeadline(time.Time{})
 	ctx, cancel := context.WithCancel(context.Background())
+	logs, err := connectAccessLogs(ctx, initial.Logs)
+	if err != nil || logs == nil {
+		t.Fatalf("starting request logs: %v", err)
+	}
 	eventsDone := make(chan struct{})
 	go func() {
 		defer close(eventsDone)
@@ -81,6 +86,7 @@ func startRelayedPreview(t *testing.T, origin *httptest.Server) *relayedPreview 
 	t.Cleanup(func() {
 		cancel()
 		control.Close()
+		logs.Close()
 		listener.Close()
 		<-acceptingDone
 		client.CloseIdleConnections()
@@ -88,7 +94,7 @@ func startRelayedPreview(t *testing.T, origin *httptest.Server) *relayedPreview 
 		<-eventsDone
 		handlers.Wait()
 	})
-	return &relayedPreview{front: front, host: strings.TrimPrefix(initial.URL, "http://"), client: client}
+	return &relayedPreview{front: front, host: strings.TrimPrefix(initial.URL, "http://"), client: client, logs: logs}
 }
 
 func (p *relayedPreview) newRequest(t *testing.T, method, path string, body io.Reader) *http.Request {
@@ -161,6 +167,9 @@ func TestRelayForwardsWebSocketClosure(t *testing.T) {
 	body, err := io.ReadAll(reader)
 	if err != nil || string(body) != "bye" {
 		t.Fatalf("application's WebSocket close was not forwarded: %q, %v", body, err)
+	}
+	if entry := nextAccessLog(t, preview.logs); entry.Status != http.StatusSwitchingProtocols || entry.Path != "/socket" {
+		t.Fatalf("WebSocket upgrade was not logged: %+v", entry)
 	}
 }
 
