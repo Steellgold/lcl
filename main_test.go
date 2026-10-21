@@ -43,11 +43,14 @@ func TestClientRelay(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer control.Close()
-	json.NewEncoder(control).Encode(request{Port: backendPort(t, origin), Tunnel: true})
+	json.NewEncoder(control).Encode(request{Port: backendPort(t, origin), Tunnel: true, Name: "Etat de première version"})
 	dec := json.NewDecoder(control)
 	var initial reply
 	if e = dec.Decode(&initial); e != nil || initial.URL == "" {
 		t.Fatalf("%+v %v", initial, e)
+	}
+	if initial.URL != "http://etat-de-premiere-version."+b.domain {
+		t.Fatal(initial.URL)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

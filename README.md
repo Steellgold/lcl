@@ -12,7 +12,7 @@ $ lcl 3000
 
 `lcl` runs on the same server as your application. A local broker creates a route in your existing Traefik proxy. No external tunnel service or client account is involved.
 
-- Random subdomain for each session.
+- Random subdomains, or a chosen name with `--name`.
 - Unlimited session lifetime by default, with an optional fixed timeout.
 - WebSocket and server-sent event support.
 - Ctrl+C closes the session, including open connections.
@@ -28,9 +28,12 @@ lcl 3000
 lcl 3000 --https
 lcl 3000 -t 10
 lcl 3000 --timeout 10
+lcl 3000 --name "First version preview"
 ```
 
 The application must accept HTTP connections at `127.0.0.1:<port>` from the terminal running `lcl`. Applications listening on `0.0.0.0` work too. Supported ports are 1024–65535. `--https` changes the public URL; the application still uses HTTP locally.
+
+`--name` selects the subdomain under `LCL_DOMAIN`. Names are lowercased, Latin accents are folded, and spaces or punctuation become hyphens. For example, `État de première version` becomes `etat-de-premiere-version.preview.example.com` when `LCL_DOMAIN=preview.example.com`. The normalized name must contain 1–63 ASCII letters, digits, or hyphens. A name already held by an active session is rejected; it becomes available again when that session closes. Without `--name`, a random subdomain is generated.
 
 Keep the command running. Ctrl+C, terminal closure, or client disconnection removes the session. By default, sessions stay open indefinitely, including when there is no traffic.
 
@@ -99,7 +102,7 @@ make build
 make check
 ```
 
-The tests cover proxy forwarding, the client relay, route removal, unlimited sessions and fixed timeouts, WebSocket upgrades and traffic, user quotas, and input validation. `make check` includes the race detector and requires a C compiler.
+The tests cover proxy forwarding, the client relay, route removal, unlimited sessions and fixed timeouts, WebSocket upgrades and traffic, user quotas, name normalization and collisions, and input validation. `make check` includes the race detector and requires a C compiler. GitHub Actions runs these checks and builds the binary and Docker image on pushes to `stable` and pull requests.
 
 ## Access model
 

@@ -18,7 +18,9 @@ When running `lcl serve` directly, `LCL_CONFIG` changes the generated file path 
 
 ## Traefik and Coolify
 
-The broker generates exact-host routes with priority 100. HTTP and HTTPS entrypoint names are configurable. HTTPS sessions include an HTTP-to-HTTPS redirect. Plain HTTP sessions do not request certificates.
+The broker generates exact-host routes. Random names use priority 100; custom names use priority 1 so existing application routes take precedence. HTTP and HTTPS entrypoint names are configurable. HTTPS sessions include an HTTP-to-HTTPS redirect. Plain HTTP sessions do not request certificates.
+
+Use a dedicated preview domain when possible. If another application already serves a chosen hostname, the HTTP readiness check fails rather than replacing that application's route. Choose another name or configure a separate `LCL_DOMAIN`.
 
 Coolify deployments can use their existing Traefik dynamic directory, Docker network, and resolver. Check the actual values on your installation rather than copying values from another server. Mount the watched directory, not just `lcl.yaml`, because updates use atomic replacement.
 

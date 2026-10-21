@@ -26,6 +26,7 @@ import (
 )
 
 type request struct {
+	Name    string        `json:"name,omitempty"`
 	Timeout time.Duration `json:"timeout_ns,omitempty"`
 	Port    int           `json:"port"`
 	HTTPS   bool          `json:"https"`
@@ -43,6 +44,7 @@ type session struct {
 	host      string
 	uid       uint32
 	https     bool
+	named     bool
 	deadline  time.Time
 	proxy     *httputil.ReverseProxy
 	transport *http.Transport
@@ -77,7 +79,7 @@ func (s *session) close() {
 }
 func newSession(host string, uid uint32, r request) *session {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &session{host: host, uid: uid, https: r.HTTPS, ctx: ctx, cancel: cancel, conns: map[*sessionConn]bool{}}
+	s := &session{host: host, uid: uid, https: r.HTTPS, named: r.Name != "", ctx: ctx, cancel: cancel, conns: map[*sessionConn]bool{}}
 	if r.Timeout > 0 {
 		s.deadline = time.Now().Add(r.Timeout)
 	}
@@ -170,7 +172,12 @@ func (b *broker) saveLocked() error {
 	routers := map[string]any{}
 	for host, s := range b.sessions {
 		name := "lcl-" + strings.SplitN(host, ".", 2)[0]
-		router := map[string]any{"rule": "Host(`" + host + "`)", "entryPoints": []string{b.httpEntry}, "service": "lcl-backend", "priority": 100}
+		priority := 100
+		if s.named {
+			// Existing application routes take precedence over chosen names.
+			priority = 1
+		}
+		router := map[string]any{"rule": "Host(`" + host + "`)", "entryPoints": []string{b.httpEntry}, "service": "lcl-backend", "priority": priority}
 		if s.https {
 			router["entryPoints"] = []string{b.httpsEntry}
 			tls := map[string]any{}
@@ -178,7 +185,7 @@ func (b *broker) saveLocked() error {
 				tls["certResolver"] = b.resolver
 			}
 			router["tls"] = tls
-			routers[name+"-redirect"] = map[string]any{"rule": router["rule"], "entryPoints": []string{b.httpEntry}, "service": "lcl-backend", "priority": 100, "middlewares": []string{"lcl-https"}}
+			routers[name+"-redirect"] = map[string]any{"rule": router["rule"], "entryPoints": []string{b.httpEntry}, "service": "lcl-backend", "priority": priority, "middlewares": []string{"lcl-https"}}
 		}
 		routers[name] = router
 	}
@@ -214,6 +221,13 @@ func (b *broker) saveLocked() error {
 	return os.Rename(f.Name(), b.config)
 }
 func (b *broker) add(uid uint32, r request) (*session, error) {
+	if r.Name != "" {
+		name, e := normalizeName(r.Name)
+		if e != nil {
+			return nil, e
+		}
+		r.Name = name
+	}
 	if r.Timeout < 0 {
 		return nil, errors.New("timeout must not be negative")
 	}
@@ -240,15 +254,25 @@ func (b *broker) add(uid uint32, r request) (*session, error) {
 		return nil, errors.New("session limit reached (8 per user)")
 	}
 	var host string
-	for {
-		var v [8]byte
-		if _, e := rand.Read(v[:]); e != nil {
-			return nil, e
+	if r.Name != "" {
+		host = r.Name + "." + b.domain
+		if b.sessions[host] != nil {
+			return nil, fmt.Errorf("name %q is already in use", r.Name)
 		}
-		host = hex.EncodeToString(v[:]) + "." + b.domain
-		if b.sessions[host] == nil {
-			break
+	} else {
+		for {
+			var v [8]byte
+			if _, e := rand.Read(v[:]); e != nil {
+				return nil, e
+			}
+			host = hex.EncodeToString(v[:]) + "." + b.domain
+			if b.sessions[host] == nil {
+				break
+			}
 		}
+	}
+	if len(host) > 253 {
+		return nil, errors.New("name and configured domain exceed the DNS hostname length limit")
 	}
 	s := newSession(host, uid, r)
 	b.sessions[host] = s
@@ -261,8 +285,11 @@ func (b *broker) add(uid uint32, r request) (*session, error) {
 }
 func (b *broker) remove(s *session) {
 	b.mu.Lock()
-	delete(b.sessions, s.host)
-	e := b.saveLocked()
+	var e error
+	if b.sessions[s.host] == s {
+		delete(b.sessions, s.host)
+		e = b.saveLocked()
+	}
 	b.mu.Unlock()
 	s.close()
 	if e != nil {
@@ -493,7 +520,7 @@ func env(k, d string) string {
 	return d
 }
 
-const usage = "usage: lcl <port> [--https] [-t <minutes>]"
+const usage = "usage: lcl <port> [--https] [-t <minutes>] [--name <name>]"
 
 func parseClientArgs(args []string) (request, string, error) {
 	r := request{Tunnel: true}
@@ -510,6 +537,19 @@ func parseClientArgs(args []string) (request, string, error) {
 				return r, "", errors.New(usage)
 			}
 			r.HTTPS = true
+		case "--name":
+			if !hasValue {
+				i++
+				if i >= len(args) {
+					return r, "", errors.New("--name requires a name")
+				}
+				value = args[i]
+			}
+			name, e := normalizeName(value)
+			if e != nil {
+				return r, "", e
+			}
+			r.Name = name
 		case "-t", "--timeout":
 			if !hasValue {
 				i++
@@ -544,10 +584,10 @@ func client(args []string) error {
 	}
 	switch action {
 	case "help":
-		fmt.Println("Usage: lcl <port> [--https] [-t <minutes>]\n\nPublish a local HTTP application under a random subdomain.\nSessions stay open until Ctrl+C or client disconnection by default.\n-t, --timeout <minutes>: close after a fixed duration, regardless of traffic.\n--https: enable public HTTPS; the local application still uses HTTP.\nPorts: 1024-65535. Limit: 8 sessions per user.")
+		fmt.Println("Usage: lcl <port> [--https] [-t <minutes>] [--name <name>]\n\nPublish a local HTTP application under a random or chosen subdomain.\nSessions stay open until Ctrl+C or client disconnection by default.\n-t, --timeout <minutes>: close after a fixed duration, regardless of traffic.\n--name <name>: choose a subdomain; spaces and Latin accents are normalized.\n--https: enable public HTTPS; the local application still uses HTTP.\nPorts: 1024-65535. Limit: 8 sessions per user.")
 		return nil
 	case "version":
-		fmt.Println("lcl 1.1.0")
+		fmt.Println("lcl 1.2.0")
 		return nil
 	}
 	port, https := options.Port, options.HTTPS
