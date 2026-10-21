@@ -1,0 +1,32 @@
+services:
+  broker:
+    build: .
+    image: lcl:local
+    restart: unless-stopped
+    networks:
+      proxy:
+        aliases: [lcl-broker]
+    user: "${LCL_UID:-0}:${LCL_GID:-0}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    stop_grace_period: 10s
+    environment:
+      LCL_DOMAIN: ${LCL_DOMAIN:?Set LCL_DOMAIN in .env}
+      LCL_LISTEN: ${LCL_LISTEN:-0.0.0.0:19473}
+      LCL_BACKEND_URL: ${LCL_BACKEND_URL:-http://lcl-broker:19473}
+      LCL_IDLE_TIMEOUT: ${LCL_IDLE_TIMEOUT:-10m}
+      LCL_CERT_RESOLVER: ${LCL_CERT_RESOLVER:-}
+      LCL_HTTP_ENTRYPOINT: ${LCL_HTTP_ENTRYPOINT:-http}
+      LCL_HTTPS_ENTRYPOINT: ${LCL_HTTPS_ENTRYPOINT:-https}
+    volumes:
+      - /run/lcl:/run/lcl
+      - ${TRAEFIK_DYNAMIC_DIR:?Set TRAEFIK_DYNAMIC_DIR in .env}:/dynamic
+
+networks:
+  proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK:?Set TRAEFIK_NETWORK in .env}

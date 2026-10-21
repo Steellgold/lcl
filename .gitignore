@@ -1,0 +1,10 @@
+/lcl
+/bin/
+/coverage.out
+.env
+.env.*
+!.env.example
+*.log
+*.test
+.DS_Store
+compose.override.yaml
