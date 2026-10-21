@@ -102,7 +102,7 @@ make build
 make check
 ```
 
-The tests cover proxy forwarding, the client relay, route removal, unlimited sessions and fixed timeouts, WebSocket upgrades and traffic, user quotas, name normalization and collisions, and input validation. `make check` includes the race detector and requires a C compiler. GitHub Actions runs these checks and builds the binary and Docker image on pushes to `stable` and pull requests.
+The tests exercise complete HTTP-to-Unix-to-TCP relays, including idle connection closure, WebSockets, SSE, uploads, and canceled or concurrent requests. They also cover session lifetimes, cleanup, quotas, and name validation. `make check` includes the race detector and requires a C compiler. GitHub Actions runs these checks and builds the binary and Docker image on pushes to `stable` and pull requests.
 
 ## AI skills
 

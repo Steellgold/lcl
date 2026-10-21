@@ -20,61 +20,20 @@ import (
 
 func TestClientRelay(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "relayed "+r.URL.Path) }))
-	defer origin.Close()
-	b := testBroker(t)
-	path := filepath.Join(t.TempDir(), "relay.sock")
-	t.Setenv("LCL_SOCKET", path)
-	listener, e := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
-	if e != nil {
-		t.Fatal(e)
+	t.Cleanup(origin.Close)
+	preview := startRelayedPreview(t, origin)
+	if preview.host != "etat-de-premiere-version.preview.example.test" {
+		t.Fatal(preview.host)
 	}
-	defer listener.Close()
-	go func() {
-		for {
-			c, e := listener.AcceptUnix()
-			if e != nil {
-				return
-			}
-			go b.control(c)
-		}
-	}()
-	control, e := net.Dial("unix", path)
-	if e != nil {
-		t.Fatal(e)
+	response, err := preview.client.Do(preview.newRequest(t, http.MethodGet, "/through-client", nil))
+	if err != nil {
+		t.Fatal(err)
 	}
-	defer control.Close()
-	json.NewEncoder(control).Encode(request{Port: backendPort(t, origin), Tunnel: true, Name: "Etat de première version"})
-	dec := json.NewDecoder(control)
-	var initial reply
-	if e = dec.Decode(&initial); e != nil || initial.URL == "" {
-		t.Fatalf("%+v %v", initial, e)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || err != nil || string(body) != "relayed /through-client" {
+		t.Fatalf("%d %q %v", response.StatusCode, body, err)
 	}
-	if initial.URL != "http://etat-de-premiere-version."+b.domain {
-		t.Fatal(initial.URL)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	eventsDone := make(chan struct{})
-	go func() {
-		defer close(eventsDone)
-		for {
-			var r reply
-			if dec.Decode(&r) != nil {
-				return
-			}
-			if r.Dial != "" {
-				go relay(ctx, backendPort(t, origin), r.Dial)
-			}
-		}
-	}()
-	rec := httptest.NewRecorder()
-	b.ServeHTTP(rec, httptest.NewRequest("GET", initial.URL+"/through-client", nil))
-	if rec.Code != 200 || rec.Body.String() != "relayed /through-client" {
-		t.Fatalf("%d %s", rec.Code, rec.Body.String())
-	}
-	control.Close()
-	cancel()
-	<-eventsDone
 }
 
 func TestDomainValidation(t *testing.T) {

@@ -42,6 +42,14 @@ Traffic does not change a session's lifetime. The previous `LCL_IDLE_TIMEOUT` se
 
 The broker has no session database. Startup clears its generated routes; a crash or restart ends all sessions. Docker's `unless-stopped` policy restarts the broker after a process failure or host reboot. Clients must run `lcl` again.
 
+## Connection handling
+
+The relay forwards closure in each direction while allowing the other direction to finish sending pending data. When an application closes an idle HTTP connection, the broker can establish a fresh connection for the next request. WebSocket closures are forwarded too; SSE data is streamed as it arrives.
+
+If the client cannot connect to the local application, the broker returns HTTP 502. The upstream response-header timeout is 60 seconds; reaching it returns HTTP 504. These request failures leave the preview session open, so subsequent requests can recover after an application restart. Streaming responses and upgraded connections have no fixed lifetime unless the session was started with `-t` or `--timeout`.
+
+Unexpected proxy errors are logged with the preview hostname. Full request URLs and headers are not included in these messages.
+
 ## Logs and upgrades
 
 ```sh

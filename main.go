@@ -26,13 +26,14 @@ import (
 )
 
 type request struct {
-	Name    string        `json:"name,omitempty"`
-	Timeout time.Duration `json:"timeout_ns,omitempty"`
-	Port    int           `json:"port"`
-	HTTPS   bool          `json:"https"`
-	Tunnel  bool          `json:"tunnel,omitempty"`
-	Attach  string        `json:"attach,omitempty"`
-	dial    func(context.Context) (net.Conn, error)
+	Name       string        `json:"name,omitempty"`
+	Timeout    time.Duration `json:"timeout_ns,omitempty"`
+	Port       int           `json:"port"`
+	HTTPS      bool          `json:"https"`
+	Tunnel     bool          `json:"tunnel,omitempty"`
+	Attach     string        `json:"attach,omitempty"`
+	RelayError string        `json:"relay_error,omitempty"`
+	dial       func(context.Context) (net.Conn, error)
 }
 type reply struct {
 	URL     string `json:"url,omitempty"`
@@ -117,6 +118,15 @@ func newSession(host string, uid uint32, r request) *session {
 		}
 		p.Out.Header.Set("X-Forwarded-Proto", scheme)
 	}, ErrorHandler: func(w http.ResponseWriter, r *http.Request, e error) {
+		if r.Context().Err() != nil {
+			return
+		}
+		log.Printf("proxy %s: %v", s.host, e)
+		var timeout net.Error
+		if errors.As(e, &timeout) && timeout.Timeout() {
+			http.Error(w, "lcl: local application timed out", http.StatusGatewayTimeout)
+			return
+		}
 		http.Error(w, "lcl: local application unavailable", http.StatusBadGateway)
 	}}
 	return s
@@ -135,8 +145,13 @@ type broker struct {
 }
 
 type pendingConn struct {
-	uid  uint32
-	conn chan net.Conn
+	uid    uint32
+	result chan dialResult
+}
+
+type dialResult struct {
+	conn net.Conn
+	err  error
 }
 
 func (b *broker) tunnelDial(ctx context.Context, uid uint32, send func(reply) error) (net.Conn, error) {
@@ -145,7 +160,7 @@ func (b *broker) tunnelDial(ctx context.Context, uid uint32, send func(reply) er
 		return nil, e
 	}
 	token := hex.EncodeToString(key[:])
-	p := &pendingConn{uid: uid, conn: make(chan net.Conn)}
+	p := &pendingConn{uid: uid, result: make(chan dialResult)}
 	b.mu.Lock()
 	if b.pending == nil {
 		b.pending = map[string]*pendingConn{}
@@ -159,8 +174,8 @@ func (b *broker) tunnelDial(ctx context.Context, uid uint32, send func(reply) er
 	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()
 	select {
-	case c := <-p.conn:
-		return c, nil
+	case result := <-p.result:
+		return result.conn, result.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-timer.C:
@@ -372,6 +387,15 @@ func (b *broker) control(c *net.UnixConn) {
 			send(reply{Error: "invalid relay token"})
 			return
 		}
+		if r.RelayError != "" {
+			timer := time.NewTimer(2 * time.Second)
+			defer timer.Stop()
+			select {
+			case p.result <- dialResult{err: fmt.Errorf("client could not connect to the local application: %s", r.RelayError)}:
+			case <-timer.C:
+			}
+			return
+		}
 		if send(reply{Message: "attached"}) != nil {
 			return
 		}
@@ -379,7 +403,7 @@ func (b *broker) control(c *net.UnixConn) {
 		timer := time.NewTimer(2 * time.Second)
 		defer timer.Stop()
 		select {
-		case p.conn <- c:
+		case p.result <- dialResult{conn: c}:
 			owned = false
 		case <-timer.C:
 		}
@@ -587,7 +611,7 @@ func client(args []string) error {
 		fmt.Println("Usage: lcl <port> [--https] [-t <minutes>] [--name <name>]\n\nPublish a local HTTP application under a random or chosen subdomain.\nSessions stay open until Ctrl+C or client disconnection by default.\n-t, --timeout <minutes>: close after a fixed duration, regardless of traffic.\n--name <name>: choose a subdomain; spaces and Latin accents are normalized.\n--https: enable public HTTPS; the local application still uses HTTP.\nPorts: 1024-65535. Limit: 8 sessions per user.")
 		return nil
 	case "version":
-		fmt.Println("lcl 1.2.0")
+		fmt.Println("lcl 1.2.1")
 		return nil
 	}
 	port, https := options.Port, options.HTTPS
@@ -702,20 +726,31 @@ func waitForRoute(ctx context.Context, rawURL string) error {
 // relay connects to localhost in the client's network namespace, so a terminal
 // inside a container can publish applications without exposing a new TCP port.
 func relay(ctx context.Context, port int, token string) {
-	local, e := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if e != nil {
-		return
+	local, localError := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if local != nil {
+		defer local.Close()
 	}
-	defer local.Close()
 	tunnel, e := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", env("LCL_SOCKET", "/run/lcl/control.sock"))
 	if e != nil {
 		return
 	}
 	defer tunnel.Close()
-	stop := context.AfterFunc(ctx, func() { local.Close(); tunnel.Close() })
+	stop := context.AfterFunc(ctx, func() {
+		if local != nil {
+			local.Close()
+		}
+		tunnel.Close()
+	})
 	defer stop()
 	tunnel.SetDeadline(time.Now().Add(5 * time.Second))
-	if e = json.NewEncoder(tunnel).Encode(request{Attach: token}); e != nil {
+	attachment := request{Attach: token}
+	if localError != nil {
+		attachment.RelayError = localError.Error()
+	}
+	if e = json.NewEncoder(tunnel).Encode(attachment); e != nil {
+		return
+	}
+	if localError != nil {
 		return
 	}
 	reader := bufio.NewReader(tunnel)
@@ -728,11 +763,31 @@ func relay(ctx context.Context, port int, token string) {
 		return
 	}
 	tunnel.SetDeadline(time.Time{})
-	done := make(chan struct{}, 1)
-	go func() { io.Copy(tunnel, local); done <- struct{}{} }()
-	io.Copy(local, reader)
-	tunnel.Close()
-	local.Close()
+	bridgeConnections(local, tunnel, reader)
+}
+
+// Propagate each direction's EOF without discarding the other direction's
+// pending bytes. Otherwise the broker can cache a connection the app has closed.
+func bridgeConnections(local, tunnel net.Conn, incoming io.Reader) {
+	done := make(chan struct{}, 2)
+	closeBoth := func() { local.Close(); tunnel.Close() }
+	copyDirection := func(dst net.Conn, src io.Reader) {
+		defer func() { done <- struct{}{} }()
+		if _, err := io.Copy(dst, src); err != nil {
+			closeBoth()
+			return
+		}
+		if writer, ok := dst.(interface{ CloseWrite() error }); ok {
+			if writer.CloseWrite() != nil {
+				closeBoth()
+			}
+		} else {
+			closeBoth()
+		}
+	}
+	go copyDirection(tunnel, local)
+	go copyDirection(local, incoming)
+	<-done
 	<-done
 }
 func main() {
