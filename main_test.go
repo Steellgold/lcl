@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -93,7 +94,6 @@ func TestReadinessProbeDoesNotReachApplication(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer b.remove(s)
-	before := s.last.Load()
 	req := httptest.NewRequest(http.MethodHead, "http://"+s.host+"/.well-known/lcl/ready", nil)
 	req.Header.Set("X-Lcl-Probe", s.host)
 	rec := httptest.NewRecorder()
@@ -101,14 +101,11 @@ func TestReadinessProbeDoesNotReachApplication(t *testing.T) {
 	if rec.Code != http.StatusNoContent || rec.Header().Get("X-Lcl-Ready") != s.host {
 		t.Fatalf("%d %v", rec.Code, rec.Header())
 	}
-	if before != s.last.Load() {
-		t.Fatal("readiness probe renewed session")
-	}
 }
 
 func testBroker(t *testing.T) *broker {
 	t.Helper()
-	return &broker{sessions: map[string]*session{}, config: filepath.Join(t.TempDir(), "lcl.yaml"), backend: "http://127.0.0.1:19473", ttl: 750 * time.Millisecond, domain: "preview.example.test", resolver: "letsencrypt", httpEntry: "http", httpsEntry: "https"}
+	return &broker{sessions: map[string]*session{}, config: filepath.Join(t.TempDir(), "lcl.yaml"), backend: "http://127.0.0.1:19473", domain: "preview.example.test", resolver: "letsencrypt", httpEntry: "http", httpsEntry: "https"}
 }
 func backendPort(t *testing.T, s *httptest.Server) int {
 	t.Helper()
@@ -147,11 +144,22 @@ func TestProxyAndRemoval(t *testing.T) {
 		t.Fatal("route retained")
 	}
 }
-func TestControlActivityExpirationAndDisconnect(t *testing.T) {
+func TestControlLifetimeAndDisconnect(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") }))
 	defer origin.Close()
-	for _, disconnect := range []bool{false, true} {
-		t.Run(fmt.Sprint(disconnect), func(t *testing.T) {
+	cases := []struct {
+		name                 string
+		timeout              time.Duration
+		activity, disconnect bool
+	}{
+		{name: "unlimited idle"},
+		{name: "unlimited active", activity: true},
+		{name: "timed idle", timeout: 200 * time.Millisecond},
+		{name: "timed active", timeout: 200 * time.Millisecond, activity: true},
+		{name: "disconnect", timeout: time.Minute, disconnect: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			b := testBroker(t)
 			path := filepath.Join(t.TempDir(), "s.sock")
 			l, e := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
@@ -161,11 +169,11 @@ func TestControlActivityExpirationAndDisconnect(t *testing.T) {
 			defer l.Close()
 			finished := make(chan struct{})
 			go func() {
+				defer close(finished)
 				c, e := l.AcceptUnix()
 				if e == nil {
 					b.control(c)
 				}
-				close(finished)
 			}()
 			c, e := net.Dial("unix", path)
 			if e != nil {
@@ -173,38 +181,64 @@ func TestControlActivityExpirationAndDisconnect(t *testing.T) {
 			}
 			defer c.Close()
 			c.SetDeadline(time.Now().Add(5 * time.Second))
-			json.NewEncoder(c).Encode(request{Port: backendPort(t, origin)})
+			json.NewEncoder(c).Encode(request{Port: backendPort(t, origin), Timeout: tc.timeout})
 			dec := json.NewDecoder(c)
-			var r reply
-			if e = dec.Decode(&r); e != nil || r.URL == "" {
-				t.Fatalf("%+v %v", r, e)
+			var initial reply
+			if e = dec.Decode(&initial); e != nil || initial.URL == "" {
+				t.Fatalf("%+v %v", initial, e)
 			}
-			host := strings.TrimPrefix(r.URL, "http://")
-			if disconnect {
-				c.Close()
-			} else {
-				for i := 0; i < 4; i++ {
-					time.Sleep(300 * time.Millisecond)
-					rec := httptest.NewRecorder()
-					b.ServeHTTP(rec, httptest.NewRequest("GET", r.URL, nil))
-					if rec.Code != 200 {
-						t.Fatal("expired while active")
+			host := strings.TrimPrefix(initial.URL, "http://")
+			b.mu.RLock()
+			s := b.sessions[host]
+			b.mu.RUnlock()
+			if s.deadline.IsZero() != (tc.timeout == 0) {
+				t.Fatal("incorrect session deadline")
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var requests atomic.Int64
+			if tc.activity {
+				go func() {
+					tick := time.NewTicker(10 * time.Millisecond)
+					defer tick.Stop()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case <-tick.C:
+							rec := httptest.NewRecorder()
+							b.ServeHTTP(rec, httptest.NewRequest("GET", initial.URL, nil))
+							if rec.Code == 200 {
+								requests.Add(1)
+							}
+						}
 					}
+				}()
+			}
+			switch {
+			case tc.disconnect:
+				c.Close()
+			case tc.timeout == 0:
+				select {
+				case <-finished:
+					t.Fatal("unlimited session expired")
+				case <-time.After(350 * time.Millisecond):
 				}
-				b.mu.RLock()
-				n := len(b.sessions)
-				b.mu.RUnlock()
-				if n != 1 {
-					t.Fatal("session missing")
-				}
-				if e = dec.Decode(&r); e != nil || r.Message == "" {
-					t.Fatalf("expiration: %+v %v", r, e)
+				c.Close()
+			default:
+				var end reply
+				if e = dec.Decode(&end); e != nil || !strings.Contains(end.Message, "timeout") {
+					t.Fatalf("expiration: %+v %v", end, e)
 				}
 			}
 			select {
 			case <-finished:
 			case <-time.After(3 * time.Second):
 				t.Fatal("control did not stop")
+			}
+			cancel()
+			if tc.activity && requests.Load() == 0 {
+				t.Fatal("test sent no activity")
 			}
 			b.mu.RLock()
 			n := len(b.sessions)
@@ -219,6 +253,37 @@ func TestControlActivityExpirationAndDisconnect(t *testing.T) {
 		})
 	}
 }
+
+func TestClientTimeoutArguments(t *testing.T) {
+	cases := []struct {
+		args    []string
+		minutes int
+		https   bool
+	}{
+		{args: []string{"3000"}},
+		{args: []string{"3000", "-t", "10"}, minutes: 10},
+		{args: []string{"3000", "--timeout", "5", "--https"}, minutes: 5, https: true},
+		{args: []string{"-t", "2", "3000"}, minutes: 2},
+		{args: []string{"3000", "--timeout=3"}, minutes: 3},
+		{args: []string{"3000", "-t=4"}, minutes: 4},
+	}
+	for _, tc := range cases {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			r, action, e := parseClientArgs(tc.args)
+			if e != nil || action != "" || r.Port != 3000 || r.HTTPS != tc.https || r.Timeout != time.Duration(tc.minutes)*time.Minute {
+				t.Fatalf("%+v %q %v", r, action, e)
+			}
+		})
+	}
+	for _, args := range [][]string{{"3000", "-t"}, {"3000", "--timeout"}, {"3000", "-t", "0"}, {"3000", "-t", "-1"}, {"3000", "-t", "1.5"}, {"3000", "-t", "hello"}, {"3000", "-t", "153722868"}, {"3000", "-t", "99999999999999999999"}, {"3000", "--https=yes"}} {
+		t.Run("invalid "+strings.Join(args, " "), func(t *testing.T) {
+			if _, _, e := parseClientArgs(args); e == nil {
+				t.Fatal("invalid arguments accepted")
+			}
+		})
+	}
+}
+
 func TestWebSocketUpgradeAndTraffic(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, rw, e := w.(http.Hijacker).Hijack()
@@ -254,15 +319,10 @@ func TestWebSocketUpgradeAndTraffic(t *testing.T) {
 	if resp.StatusCode != 101 {
 		t.Fatal(resp.StatusCode)
 	}
-	before := s.last.Load()
-	time.Sleep(10 * time.Millisecond)
 	c.Write([]byte("activity"))
 	v := make([]byte, 8)
 	if _, e = io.ReadFull(reader, v); e != nil || string(v) != "activity" {
 		t.Fatalf("%q %v", v, e)
-	}
-	if s.last.Load() <= before {
-		t.Fatal("websocket activity not recorded")
 	}
 	s.close()
 	c.SetReadDeadline(time.Now().Add(time.Second))
@@ -271,6 +331,9 @@ func TestWebSocketUpgradeAndTraffic(t *testing.T) {
 	}
 }
 func TestLimitsAndValidation(t *testing.T) {
+	if _, e := testBroker(t).add(1, request{Port: 3000, Timeout: -time.Second}); e == nil {
+		t.Fatal("negative timeout accepted")
+	}
 	b := testBroker(t)
 	if _, e := b.add(1, request{Port: 80}); e == nil {
 		t.Fatal("privileged port accepted")

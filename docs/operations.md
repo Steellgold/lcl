@@ -9,7 +9,6 @@ The Compose deployment reads `.env`. This file is ignored by Git; `.env.example`
 | `TRAEFIK_NETWORK` | Required in Compose | Existing Docker network shared with Traefik. |
 | `LCL_LISTEN` | `0.0.0.0:19473` in Compose | Broker HTTP listener inside the container; no port is published. |
 | `LCL_BACKEND_URL` | `http://lcl-broker:19473` in Compose | Broker URL written into Traefik routes. Set it alongside the listener. |
-| `LCL_IDLE_TIMEOUT` | `10m` | Idle lifetime, in Go duration syntax. |
 | `LCL_HTTP_ENTRYPOINT` | `http` | Existing Traefik HTTP entrypoint. |
 | `LCL_HTTPS_ENTRYPOINT` | `https` | Existing Traefik HTTPS entrypoint. |
 | `LCL_CERT_RESOLVER` | Empty | Existing Traefik ACME resolver. Empty uses certificates already loaded by Traefik. |
@@ -27,7 +26,7 @@ Traefik applies file changes asynchronously. A new URL may take a few seconds to
 
 ## Lifecycle
 
-The client holds a Unix socket connection for the session's lifetime. The broker authenticates its Linux UID with `SO_PEERCRED` and enforces per-user quotas. Each upstream connection is relayed over a separate Unix socket connection authenticated by UID and a one-time token. Client closure removes the route. Idle expiration also cancels active requests and closes backend connections.
+The client holds a Unix socket connection for the session's lifetime. The broker authenticates its Linux UID with `SO_PEERCRED` and enforces per-user quotas. Each upstream connection is relayed over a separate Unix socket connection authenticated by UID and a one-time token. Client closure removes the route. Sessions have no timeout by default. With `-t <minutes>` or `--timeout <minutes>`, the broker enforces a fixed deadline from session creation, cancels active requests, and closes backend connections when the deadline is reached.
 
 ## Container terminals
 
@@ -37,7 +36,7 @@ For example, mount a host directory into the broker as `/shared-runtime`, set `L
 
 Use a local, ignored `compose.override.yaml` for machine-specific mounts. For an already-running terminal, an administrator can install a launcher in its existing `PATH` that sets `LCL_SOCKET` and executes the static client. Make that launcher part of the development image or a persistent shared directory for subsequent deployments.
 
-The broker measures activity on upstream reads and writes, and at the start of each request. TCP keepalive packets do not reset the timer. SSE events and WebSocket frames do.
+Traffic does not change a session's lifetime. The previous `LCL_IDLE_TIMEOUT` setting has been removed; remove it from existing `.env` files when upgrading. Older clients without the timeout option create unlimited sessions after the broker is upgraded.
 
 The broker has no session database. Startup clears its generated routes; a crash or restart ends all sessions. Docker's `unless-stopped` policy restarts the broker after a process failure or host reboot. Clients must run `lcl` again.
 

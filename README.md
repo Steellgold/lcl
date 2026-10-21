@@ -7,13 +7,13 @@ $ lcl 3000
 
   http://a3f09d72b18c460e.preview.example.com → http://127.0.0.1:3000
 
-  Closes after inactivity (default: 10 min). Press Ctrl+C to stop.
+  Stays open until you stop it. Press Ctrl+C to stop.
 ```
 
 `lcl` runs on the same server as your application. A local broker creates a route in your existing Traefik proxy. No external tunnel service or client account is involved.
 
 - Random subdomain for each session.
-- Ten-minute idle timeout, refreshed by HTTP requests and application traffic.
+- Unlimited session lifetime by default, with an optional fixed timeout.
 - WebSocket and server-sent event support.
 - Ctrl+C closes the session, including open connections.
 - One shared installation for all local users, without giving them Docker access.
@@ -26,13 +26,17 @@ Start your application, then run:
 ```sh
 lcl 3000
 lcl 3000 --https
+lcl 3000 -t 10
+lcl 3000 --timeout 10
 ```
 
 The application must accept HTTP connections at `127.0.0.1:<port>` from the terminal running `lcl`. Applications listening on `0.0.0.0` work too. Supported ports are 1024–65535. `--https` changes the public URL; the application still uses HTTP locally.
 
-Keep the command running. Ctrl+C, terminal closure, or client disconnection removes the session. Requests, streaming data, and WebSocket traffic reset the idle timer. An open connection with no traffic still expires. Automated polling also counts as activity.
+Keep the command running. Ctrl+C, terminal closure, or client disconnection removes the session. By default, sessions stay open indefinitely, including when there is no traffic.
 
-For HTTP sessions, the client checks the public route before printing the URL. This usually takes a few seconds while Traefik loads the change. The check does not call your application or extend the session's idle timer.
+Use `-t <minutes>` or `--timeout <minutes>` for an automatic cutoff. For example, `lcl 3000 -t 10` closes the session ten minutes after its creation, regardless of HTTP requests, SSE data, or WebSocket traffic. The timeout must be a positive whole number of minutes. Expiration closes active connections as well as the public route.
+
+For HTTP sessions, the client checks the public route before printing the URL. This usually takes a few seconds while Traefik loads the change. The timeout includes this setup time; readiness checks do not call your application.
 
 Each Linux user can hold eight sessions; the broker accepts 256 sessions in total. Sessions are not restored after a broker restart.
 
@@ -95,7 +99,7 @@ make build
 make check
 ```
 
-The tests cover proxy forwarding, the client relay, route removal, idle renewal and expiration, WebSocket upgrades and traffic, user quotas, and input validation. `make check` includes the race detector and requires a C compiler.
+The tests cover proxy forwarding, the client relay, route removal, unlimited sessions and fixed timeouts, WebSocket upgrades and traffic, user quotas, and input validation. `make check` includes the race detector and requires a C compiler.
 
 ## Access model
 

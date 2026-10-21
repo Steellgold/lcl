@@ -21,17 +21,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type request struct {
-	Port   int    `json:"port"`
-	HTTPS  bool   `json:"https"`
-	Tunnel bool   `json:"tunnel,omitempty"`
-	Attach string `json:"attach,omitempty"`
-	dial   func(context.Context) (net.Conn, error)
+	Timeout time.Duration `json:"timeout_ns,omitempty"`
+	Port    int           `json:"port"`
+	HTTPS   bool          `json:"https"`
+	Tunnel  bool          `json:"tunnel,omitempty"`
+	Attach  string        `json:"attach,omitempty"`
+	dial    func(context.Context) (net.Conn, error)
 }
 type reply struct {
 	URL     string `json:"url,omitempty"`
@@ -43,45 +43,30 @@ type session struct {
 	host      string
 	uid       uint32
 	https     bool
-	last      atomic.Int64
+	deadline  time.Time
 	proxy     *httputil.ReverseProxy
 	transport *http.Transport
 	ctx       context.Context
 	cancel    context.CancelFunc
 	mu        sync.Mutex
-	conns     map[*activityConn]bool
+	conns     map[*sessionConn]bool
 }
-type activityConn struct {
+type sessionConn struct {
 	net.Conn
 	s *session
 }
 
-func (c *activityConn) Read(p []byte) (int, error) {
-	n, e := c.Conn.Read(p)
-	if n > 0 {
-		c.s.touch()
-	}
-	return n, e
-}
-func (c *activityConn) Write(p []byte) (int, error) {
-	n, e := c.Conn.Write(p)
-	if n > 0 {
-		c.s.touch()
-	}
-	return n, e
-}
-func (c *activityConn) Close() error {
+func (c *sessionConn) Close() error {
 	c.s.mu.Lock()
 	delete(c.s.conns, c)
 	c.s.mu.Unlock()
 	return c.Conn.Close()
 }
-func (s *session) touch() { s.last.Store(time.Now().UnixNano()) }
 func (s *session) close() {
 	s.cancel()
 	s.transport.CloseIdleConnections()
 	s.mu.Lock()
-	cs := make([]*activityConn, 0, len(s.conns))
+	cs := make([]*sessionConn, 0, len(s.conns))
 	for c := range s.conns {
 		cs = append(cs, c)
 	}
@@ -92,8 +77,10 @@ func (s *session) close() {
 }
 func newSession(host string, uid uint32, r request) *session {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &session{host: host, uid: uid, https: r.HTTPS, ctx: ctx, cancel: cancel, conns: map[*activityConn]bool{}}
-	s.touch()
+	s := &session{host: host, uid: uid, https: r.HTTPS, ctx: ctx, cancel: cancel, conns: map[*sessionConn]bool{}}
+	if r.Timeout > 0 {
+		s.deadline = time.Now().Add(r.Timeout)
+	}
 	target, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", r.Port))
 	s.transport = &http.Transport{MaxIdleConnsPerHost: 8, IdleConnTimeout: 90 * time.Second, ResponseHeaderTimeout: 60 * time.Second}
 	s.transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -107,7 +94,7 @@ func newSession(host string, uid uint32, r request) *session {
 		if e != nil {
 			return nil, e
 		}
-		a := &activityConn{Conn: c, s: s}
+		a := &sessionConn{Conn: c, s: s}
 		s.mu.Lock()
 		if s.ctx.Err() != nil {
 			s.mu.Unlock()
@@ -138,7 +125,6 @@ type broker struct {
 	sessions   map[string]*session
 	config     string
 	backend    string
-	ttl        time.Duration
 	domain     string
 	resolver   string
 	httpEntry  string
@@ -228,6 +214,9 @@ func (b *broker) saveLocked() error {
 	return os.Rename(f.Name(), b.config)
 }
 func (b *broker) add(uid uint32, r request) (*session, error) {
+	if r.Timeout < 0 {
+		return nil, errors.New("timeout must not be negative")
+	}
 	if r.Port < 1024 || r.Port > 65535 {
 		return nil, errors.New("port must be between 1024 and 65535")
 	}
@@ -297,7 +286,6 @@ func (b *broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	s.touch()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	stop := context.AfterFunc(s.ctx, cancel)
@@ -389,22 +377,19 @@ func (b *broker) control(c *net.UnixConn) {
 	}
 	disconnected := make(chan struct{})
 	go func() { var p [1]byte; c.Read(p[:]); close(disconnected) }()
-	tick := time.NewTicker(250 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		select {
-		case <-disconnected:
-			return
-		case <-s.ctx.Done():
-			return
-		case <-tick.C:
-			if time.Since(time.Unix(0, s.last.Load())) >= b.ttl {
-				c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				send(reply{Message: "Session expired due to inactivity."})
-				return
-			}
-		}
+	var expired <-chan time.Time
+	if !s.deadline.IsZero() {
+		timer := time.NewTimer(time.Until(s.deadline))
+		defer timer.Stop()
+		expired = timer.C
 	}
+	select {
+	case <-disconnected:
+	case <-s.ctx.Done():
+	case <-expired:
+		send(reply{Message: "Session expired after the configured timeout."})
+	}
+
 }
 func serve() error {
 	socket := env("LCL_SOCKET", "/run/lcl/control.sock")
@@ -413,11 +398,8 @@ func serve() error {
 	if !validDomain(domain) {
 		return errors.New("LCL_DOMAIN must be a valid domain, such as preview.example.com")
 	}
-	ttl, e := time.ParseDuration(env("LCL_IDLE_TIMEOUT", "10m"))
-	if e != nil || ttl <= 0 {
-		return errors.New("invalid LCL_IDLE_TIMEOUT")
-	}
-	b := &broker{sessions: map[string]*session{}, config: env("LCL_CONFIG", "/dynamic/lcl.yaml"), backend: env("LCL_BACKEND_URL", "http://"+addr), ttl: ttl, domain: domain, resolver: os.Getenv("LCL_CERT_RESOLVER"), httpEntry: env("LCL_HTTP_ENTRYPOINT", "http"), httpsEntry: env("LCL_HTTPS_ENTRYPOINT", "https")}
+	b := &broker{sessions: map[string]*session{}, config: env("LCL_CONFIG", "/dynamic/lcl.yaml"), backend: env("LCL_BACKEND_URL", "http://"+addr), domain: domain, resolver: os.Getenv("LCL_CERT_RESOLVER"), httpEntry: env("LCL_HTTP_ENTRYPOINT", "http"), httpsEntry: env("LCL_HTTPS_ENTRYPOINT", "https")}
+	var e error
 	if e = b.saveLocked(); e != nil {
 		return e
 	}
@@ -465,7 +447,7 @@ func serve() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() { <-ctx.Done(); ctl.Close() }()
-	log.Printf("lcl ready on %s, inactivity %s", addr, ttl)
+	log.Printf("lcl ready on %s; sessions have no timeout by default", addr)
 	for {
 		c, e := ctl.AcceptUnix()
 		if e != nil {
@@ -510,30 +492,65 @@ func env(k, d string) string {
 	}
 	return d
 }
-func client(args []string) error {
-	https := false
-	port := 0
-	for _, a := range args {
-		switch a {
-		case "--https":
-			https = true
+
+const usage = "usage: lcl <port> [--https] [-t <minutes>]"
+
+func parseClientArgs(args []string) (request, string, error) {
+	r := request{Tunnel: true}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		key, value, hasValue := strings.Cut(arg, "=")
+		switch key {
 		case "-h", "--help":
-			fmt.Println("Usage: lcl <port> [--https]\n\nPublish a local HTTP application under a random subdomain.\nSessions expire after 10 idle minutes by default. Ctrl+C closes the session.\n--https enables public HTTPS; the local application still uses HTTP.\nPorts: 1024-65535. Limit: 8 sessions per user.")
-			return nil
+			return r, "help", nil
 		case "--version":
-			fmt.Println("lcl 1.0.0")
-			return nil
-		default:
-			n, e := strconv.Atoi(a)
-			if e != nil || port != 0 {
-				return errors.New("usage: lcl <port> [--https]")
+			return r, "version", nil
+		case "--https":
+			if hasValue {
+				return r, "", errors.New(usage)
 			}
-			port = n
+			r.HTTPS = true
+		case "-t", "--timeout":
+			if !hasValue {
+				i++
+				if i >= len(args) {
+					return r, "", errors.New("-t/--timeout requires a duration in minutes")
+				}
+				value = args[i]
+			}
+			minutes, e := strconv.ParseInt(value, 10, 64)
+			if e != nil || minutes <= 0 || minutes > (1<<63-1)/int64(time.Minute) {
+				return r, "", errors.New("timeout must be a positive whole number of minutes within the supported range")
+			}
+			r.Timeout = time.Duration(minutes) * time.Minute
+		default:
+			n, e := strconv.Atoi(arg)
+			if e != nil || r.Port != 0 {
+				return r, "", errors.New(usage)
+			}
+			r.Port = n
 		}
 	}
-	if port < 1024 || port > 65535 {
-		return errors.New("specify a port between 1024 and 65535: lcl 3000 [--https]")
+	if r.Port < 1024 || r.Port > 65535 {
+		return r, "", errors.New("specify a port between 1024 and 65535: lcl 3000 [-t <minutes>]")
 	}
+	return r, "", nil
+}
+
+func client(args []string) error {
+	options, action, e := parseClientArgs(args)
+	if e != nil {
+		return e
+	}
+	switch action {
+	case "help":
+		fmt.Println("Usage: lcl <port> [--https] [-t <minutes>]\n\nPublish a local HTTP application under a random subdomain.\nSessions stay open until Ctrl+C or client disconnection by default.\n-t, --timeout <minutes>: close after a fixed duration, regardless of traffic.\n--https: enable public HTTPS; the local application still uses HTTP.\nPorts: 1024-65535. Limit: 8 sessions per user.")
+		return nil
+	case "version":
+		fmt.Println("lcl 1.1.0")
+		return nil
+	}
+	port, https := options.Port, options.HTTPS
 	probe, e := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
 	if e != nil {
 		return fmt.Errorf("no service reachable at 127.0.0.1:%d", port)
@@ -544,7 +561,7 @@ func client(args []string) error {
 		return errors.New("lcl service unavailable; contact the server administrator")
 	}
 	defer c.Close()
-	if e = json.NewEncoder(c).Encode(request{Port: port, HTTPS: https, Tunnel: true}); e != nil {
+	if e = json.NewEncoder(c).Encode(options); e != nil {
 		return e
 	}
 	c.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -565,7 +582,12 @@ func client(args []string) error {
 			return e
 		}
 	}
-	fmt.Printf("\n  %s → http://127.0.0.1:%d\n\n  Closes after inactivity (default: 10 min). Press Ctrl+C to stop.\n", r.URL, port)
+	fmt.Printf("\n  %s → http://127.0.0.1:%d\n\n", r.URL, port)
+	if options.Timeout > 0 {
+		fmt.Printf("  Closes after %s, regardless of traffic. Press Ctrl+C to stop sooner.\n", options.Timeout)
+	} else {
+		fmt.Println("  Stays open until you stop it. Press Ctrl+C to stop.")
+	}
 	if https {
 		fmt.Println("  The HTTPS certificate may take a moment to be issued.")
 	}
